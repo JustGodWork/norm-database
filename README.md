@@ -125,7 +125,9 @@ nanos loads modules; it sets the global `NormDatabase` (no `require` needed).
 - [x] Async (callback) + **sync (blocking)** variants of every method.
 - [x] Connection **pool**, atomic transactions, reliable insertId.
 - [x] `:0/:1` & `?` placeholders as **real bound parameters** (injection-safe).
+- [x] **Norm adapter** (`lua/norm_adapter.lua`) — `require` it, then
+      `Norm.adapters.norm_database.new{ engine=, connection=, pool_size= }`. Sets
+      `supports_returning` (auto-detected) for pool-safe insertId, wires the Tick poll.
 - [ ] PostgreSQL engine (same API, behind libpq).
-- [ ] Interactive transactions (a pinned connection for logic-between-statements).
-- [ ] A Norm adapter (`Norm.adapters.norm_database`) wiring `supports_transactions`
-      / `supports_returning` to `true`.
+- [ ] Interactive transactions (pinned connection) → then the Norm adapter can set
+      `supports_transactions = true`. For now use `db:Transaction({...})` (batch).
