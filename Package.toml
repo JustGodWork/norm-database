@@ -1,0 +1,15 @@
+# vault configurations
+[meta]
+    # friendly name
+    title =                 "Norm Database Module"
+    # contributors
+    author =                "JustGodWork"
+    # version
+    version =               "0.0.1"
+
+# c module configurations
+[c_module]
+    # list of modules to load (without file extension)
+    modules = [
+                            "norm_database",
+    ]
