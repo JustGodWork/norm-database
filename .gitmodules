@@ -1,0 +1,3 @@
+[submodule "deps/module-sdk"]
+	path = deps/module-sdk
+	url = https://github.com/nanos-world/module-sdk
