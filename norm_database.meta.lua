@@ -5,10 +5,10 @@
 -- global (set when the native module loads).
 
 ---@class NormDatabaseOptions
----@field engine integer          One of NormDatabase.Engine.* (SQLite / MySQL / PostgreSQL).
----@field connection string       SQLite: a file path (":memory:" for an in-memory db).
----@field pool_size? integer      Worker/connection count (default 10).
----@field placeholders? string    ":" => :0/:1 named binding (default) | "?" => positional binding.
+---@field engine NormDatabaseEngines    NormDatabase.Engine.SQLite or .MySQL (MariaDB).
+---@field connection string             SQLite: a file path (":memory:" = RAM). MySQL: "host=127.0.0.1 port=3306 user=root password=.. db=mydb".
+---@field pool_size? integer            Worker/connection count (default 10).
+---@field placeholders? string          ":" => :0/:1 binding (default) | "?" => positional binding.
 
 ---@class NormDatabaseStatement
 ---@field sql string
