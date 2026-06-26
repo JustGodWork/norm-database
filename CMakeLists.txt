@@ -35,20 +35,52 @@ target_include_directories(sqlite3 PUBLIC "${sqlite3_SOURCE_DIR}")
 # our one-connection-per-worker-thread design.
 target_compile_definitions(sqlite3 PRIVATE SQLITE_THREADSAFE=2)
 
+# --- MariaDB Connector/C (MySQL / MariaDB client) -----------------------------
+# Static client, no SSL (fine for MariaDB native_password on localhost). For MySQL 8
+# caching_sha2_password, flip WITH_SSL to SCHANNEL (Windows) / OPENSSL.
+# Its CMakeLists declares a too-old cmake_minimum_required for CMake 4.x; this lets
+# the subproject configure anyway.
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+set(CONC_WITH_UNIT_TESTS    OFF CACHE BOOL "" FORCE)
+set(CONC_WITH_MSI           OFF CACHE BOOL "" FORCE)
+set(CONC_WITH_CURL          OFF CACHE BOOL "" FORCE)
+set(WITH_UNIT_TESTS         OFF CACHE BOOL "" FORCE)
+set(WITH_SSL                OFF CACHE STRING "" FORCE)
+# Force the auth/pvio plugins STATIC (only STATIC/DYNAMIC are valid). As DYNAMIC they
+# have no install destination -> configure error; STATIC compiles them into the client
+# lib (Windows crypto via crypt32, already in SYSTEM_LIBS), no DLLs to ship.
+set(CLIENT_PLUGIN_DIALOG                STATIC CACHE STRING "" FORCE)
+set(CLIENT_PLUGIN_CLIENT_ED25519        STATIC CACHE STRING "" FORCE)
+set(CLIENT_PLUGIN_CACHING_SHA2_PASSWORD STATIC CACHE STRING "" FORCE)
+set(CLIENT_PLUGIN_SHA256_PASSWORD       STATIC CACHE STRING "" FORCE)
+set(CLIENT_PLUGIN_AUTH_GSSAPI_CLIENT    STATIC CACHE STRING "" FORCE)
+set(CLIENT_PLUGIN_MYSQL_CLEAR_PASSWORD  STATIC CACHE STRING "" FORCE)
+set(CLIENT_PLUGIN_PVIO_SHMEM            STATIC CACHE STRING "" FORCE)
+set(CLIENT_PLUGIN_MYSQL_NATIVE_PASSWORD STATIC CACHE STRING "" FORCE)
+FetchContent_Declare(mariadb_connector
+    GIT_REPOSITORY https://github.com/mariadb-corporation/mariadb-connector-c.git
+    GIT_TAG v3.3.13)
+FetchContent_MakeAvailable(mariadb_connector)
+
 # --- the module ---------------------------------------------------------------
 add_library(norm_database SHARED
     src/module.cpp
-    src/database.cpp)
+    src/database.cpp
+    src/connection.cpp
+    src/sqlite_backend.cpp
+    src/mysql_backend.cpp)
 
 # nanos loads "<name>.dll" / "<name>.so" — drop the platform "lib" prefix.
 set_target_properties(norm_database PROPERTIES PREFIX "")
 
 target_include_directories(norm_database PRIVATE
     deps/module-sdk/include
-    "${sol2_SOURCE_DIR}/include")
+    "${sol2_SOURCE_DIR}/include"
+    "${mariadb_connector_SOURCE_DIR}/include"
+    "${mariadb_connector_BINARY_DIR}/include")
 
 target_compile_features(norm_database PRIVATE cxx_std_17)
-target_link_libraries(norm_database PRIVATE sqlite3)
+target_link_libraries(norm_database PRIVATE sqlite3 mariadbclient)
 
 # Lua runtime.
 # Windows: link the SDK import lib (the loader needs every symbol resolved).
