@@ -1,0 +1,5 @@
+build/
+build_linux/
+libnorm_database.so
+norm_database.dll
+.clangd
