@@ -1,58 +1,10 @@
 #include "database.hpp"
 
-#include <cstdio>
 #include <exception>
+#include <memory>
 #include <string>
 
-#include <sqlite3.h>
-
 namespace normdb {
-
-// ---------------------------------------------------------------------------
-// sqlite helpers (worker thread only) — REAL parameter binding (no string
-// interpolation), so :N / ? are injection-safe.
-// ---------------------------------------------------------------------------
-
-static void bind_one(sqlite3_stmt* st, int idx, const Value& v) {
-    std::visit([&](auto&& arg) {
-        using T = std::decay_t<decltype(arg)>;
-        if constexpr (std::is_same_v<T, std::nullptr_t>) sqlite3_bind_null(st, idx);
-        else if constexpr (std::is_same_v<T, int64_t>)   sqlite3_bind_int64(st, idx, arg);
-        else if constexpr (std::is_same_v<T, double>)    sqlite3_bind_double(st, idx, arg);
-        else                                             sqlite3_bind_text(st, idx, arg.c_str(),
-                                                              static_cast<int>(arg.size()), SQLITE_TRANSIENT);
-    }, v);
-}
-
-static void bind_positional(sqlite3_stmt* st, const std::vector<Value>& args) {
-    for (size_t i = 0; i < args.size(); ++i) bind_one(st, static_cast<int>(i) + 1, args[i]);
-}
-
-// :N mode: bind arg i to the named parameter ":i" if present. Real binding, not
-// substitution -> injection-safe; do NOT quote `:0` in the SQL.
-static void bind_named(sqlite3_stmt* st, const std::vector<Value>& args) {
-    char name[24];
-    for (size_t i = 0; i < args.size(); ++i) {
-        std::snprintf(name, sizeof(name), ":%zu", i);
-        const int idx = sqlite3_bind_parameter_index(st, name);
-        if (idx > 0) bind_one(st, idx, args[i]);
-    }
-}
-
-static Value read_column(sqlite3_stmt* st, int col) {
-    switch (sqlite3_column_type(st, col)) {
-        case SQLITE_INTEGER: return static_cast<int64_t>(sqlite3_column_int64(st, col));
-        case SQLITE_FLOAT:   return sqlite3_column_double(st, col);
-        case SQLITE_NULL:    return nullptr;
-        case SQLITE_TEXT:
-        case SQLITE_BLOB:
-        default: {
-            const auto* txt = reinterpret_cast<const char*>(sqlite3_column_text(st, col));
-            const int n = sqlite3_column_bytes(st, col);
-            return std::string(txt ? txt : "", static_cast<size_t>(n));
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Result shaping (main thread): a completion -> (result, err) Lua pair.
@@ -81,15 +33,12 @@ std::tuple<sol::object, sol::object> make_result(lua_State* L, Completion& c) {
             }
             return { arr, nil };
         }
-        case JobKind::Insert:
-            return { sol::make_object(lua, c.insert_id), nil };
-        case JobKind::Transaction:
-            return { sol::make_object(lua, true), nil };
+        case JobKind::Insert:      return { sol::make_object(lua, c.insert_id), nil };
+        case JobKind::Transaction: return { sol::make_object(lua, true), nil };
         case JobKind::Execute:
         case JobKind::Update:
         case JobKind::Prepare:
-        default:
-            return { sol::make_object(lua, c.affected), nil };
+        default:                   return { sol::make_object(lua, c.affected), nil };
     }
 }
 
@@ -119,27 +68,6 @@ void Database::close() {
     jobs_cv_.notify_all();
     for (auto& w : workers_) if (w.joinable()) w.join();
     workers_.clear();
-}
-
-sqlite3* Database::open_connection(std::string& err) {
-    if (engine_ != 0) {
-        err = "norm_database: only SQLite (engine 0) is supported for now";
-        return nullptr;
-    }
-    sqlite3* h = nullptr;
-    if (sqlite3_open(connection_.c_str(), &h) != SQLITE_OK) {
-        err = h ? sqlite3_errmsg(h) : "cannot open database";
-        if (h) sqlite3_close(h);
-        return nullptr;
-    }
-    sqlite3_busy_timeout(h, 5000);
-    sqlite3_exec(h, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
-    return h;
-}
-
-void Database::bind_args(sqlite3_stmt* st, const std::vector<Value>& args) const {
-    if (numbered_) bind_named(st, args);
-    else           bind_positional(st, args);
 }
 
 void Database::enqueue(Job&& job) {
@@ -189,103 +117,10 @@ void Database::submit_sync(JobKind kind, std::string sql, std::vector<Value> arg
     enqueue(std::move(j));
 }
 
-Completion Database::run_select(sqlite3* h, const std::string& sql, const std::vector<Value>& args) {
-    Completion c;
-    sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(h, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) {
-        c.ok = false; c.error = sqlite3_errmsg(h); return c;
-    }
-    bind_args(st, args);
-    const int cols = sqlite3_column_count(st);
-    int rc;
-    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
-        Row row; row.reserve(static_cast<size_t>(cols));
-        for (int i = 0; i < cols; ++i) {
-            const char* name = sqlite3_column_name(st, i);
-            row.push_back(Column{ name ? name : "", read_column(st, i) });
-        }
-        c.rows.push_back(std::move(row));
-    }
-    if (rc != SQLITE_DONE) { c.ok = false; c.error = sqlite3_errmsg(h); }
-    sqlite3_finalize(st);
-    return c;
-}
-
-Completion Database::run_write(sqlite3* h, const std::string& sql, const std::vector<Value>& args) {
-    Completion c;
-    sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(h, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) {
-        c.ok = false; c.error = sqlite3_errmsg(h); return c;
-    }
-    bind_args(st, args);
-    int rc = sqlite3_step(st);
-    while (rc == SQLITE_ROW) rc = sqlite3_step(st);
-    if (rc != SQLITE_DONE) {
-        c.ok = false; c.error = sqlite3_errmsg(h); sqlite3_finalize(st); return c;
-    }
-    c.affected = sqlite3_changes(h);
-    c.insert_id = sqlite3_last_insert_rowid(h); // same connection + thread -> reliable
-    sqlite3_finalize(st);
-    return c;
-}
-
-Completion Database::run_prepare(sqlite3* h, const std::string& sql, const std::vector<std::vector<Value>>& sets) {
-    Completion c;
-    sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(h, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) {
-        c.ok = false; c.error = sqlite3_errmsg(h); return c;
-    }
-    int64_t total = 0;
-    for (const auto& set : sets) {
-        sqlite3_reset(st);
-        sqlite3_clear_bindings(st);
-        bind_args(st, set);
-        int rc = sqlite3_step(st);
-        while (rc == SQLITE_ROW) rc = sqlite3_step(st);
-        if (rc != SQLITE_DONE) { c.ok = false; c.error = sqlite3_errmsg(h); break; }
-        total += sqlite3_changes(h);
-    }
-    sqlite3_finalize(st);
-    if (c.ok) { c.affected = total; c.insert_id = sqlite3_last_insert_rowid(h); }
-    return c;
-}
-
-Completion Database::run_transaction(sqlite3* h, const std::vector<Statement>& statements) {
-    Completion c;
-    char* emsg = nullptr;
-    if (sqlite3_exec(h, "BEGIN", nullptr, nullptr, &emsg) != SQLITE_OK) {
-        c.ok = false; c.error = emsg ? emsg : "BEGIN failed"; sqlite3_free(emsg); return c;
-    }
-    int64_t total = 0;
-    for (const auto& s : statements) {
-        sqlite3_stmt* st = nullptr;
-        if (sqlite3_prepare_v2(h, s.sql.c_str(), -1, &st, nullptr) != SQLITE_OK) {
-            c.ok = false; c.error = sqlite3_errmsg(h); break;
-        }
-        bind_args(st, s.params);
-        int rc = sqlite3_step(st);
-        while (rc == SQLITE_ROW) rc = sqlite3_step(st);
-        if (rc != SQLITE_DONE) { c.ok = false; c.error = sqlite3_errmsg(h); sqlite3_finalize(st); break; }
-        total += sqlite3_changes(h);
-        sqlite3_finalize(st);
-    }
-    if (c.ok) {
-        if (sqlite3_exec(h, "COMMIT", nullptr, nullptr, &emsg) != SQLITE_OK) {
-            c.ok = false; c.error = emsg ? emsg : "COMMIT failed"; sqlite3_free(emsg);
-            sqlite3_exec(h, "ROLLBACK", nullptr, nullptr, nullptr);
-        } else {
-            c.affected = total;
-        }
-    } else {
-        sqlite3_exec(h, "ROLLBACK", nullptr, nullptr, nullptr);
-    }
-    return c;
-}
-
 void Database::worker_loop(int index) {
+    std::unique_ptr<Connection> conn = make_connection(engine_);
     std::string open_err;
-    sqlite3* h = open_connection(open_err);
-    const bool opened = (h != nullptr);
+    const bool opened = conn->open(ConnInfo{ connection_, numbered_ }, open_err);
 
     if (index == 0) { // one ready notification for the pool (async, via done_)
         Completion ready; ready.kind = JobKind::Ready; ready.ok = opened; ready.error = open_err;
@@ -312,12 +147,12 @@ void Database::worker_loop(int index) {
         } else {
             try {
                 switch (job.kind) {
-                    case JobKind::Select:      c = run_select(h, job.sql, job.params); break;
+                    case JobKind::Select:      c = conn->run_select(job.sql, job.params); break;
                     case JobKind::Execute:
                     case JobKind::Insert:
-                    case JobKind::Update:      c = run_write(h, job.sql, job.params); break;
-                    case JobKind::Prepare:     c = run_prepare(h, job.sql, job.param_sets); break;
-                    case JobKind::Transaction: c = run_transaction(h, job.statements); break;
+                    case JobKind::Update:      c = conn->run_write(job.sql, job.params); break;
+                    case JobKind::Prepare:     c = conn->run_prepare(job.sql, job.param_sets); break;
+                    case JobKind::Transaction: c = conn->run_transaction(job.statements); break;
                     default:                   c.ok = false; c.error = "unknown job kind"; break;
                 }
             } catch (const std::exception& e) {
@@ -342,7 +177,7 @@ void Database::worker_loop(int index) {
         }
     }
 
-    if (h) sqlite3_close(h);
+    conn->close();
 }
 
 int Database::poll(lua_State* L) {
@@ -355,7 +190,7 @@ int Database::poll(lua_State* L) {
     int fired = 0;
     while (!local.empty()) {
         Completion c = std::move(local.front()); local.pop();
-        if (!c.cb.valid()) continue; // async job with no callback
+        if (!c.cb.valid()) continue;
 
         try {
             std::tuple<sol::object, sol::object> r = make_result(L, c);
