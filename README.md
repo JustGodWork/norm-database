@@ -3,10 +3,11 @@
 A native (C++) **database connector** for nanos world, exposed to Lua as a clean
 userdata class. It exists to give [Norm](https://github.com/JustGodWork/norm) what
 the built-in `Database` lacks: **transactions**, **reliable insertId**, and
-**prepared statements**. Both **async** (callback) and **sync** (yielding, inside a
-coroutine) variants of every method, plus a connection **pool**.
+**prepared statements**. Both **async** (callback) and **sync** (blocking) variants
+of every method, plus a connection **pool**.
 
-> First engine: **SQLite**. MySQL / PostgreSQL are planned behind the same API.
+> Engines: **SQLite** (embedded) and **MySQL / MariaDB** (via MariaDB Connector/C),
+> behind one `Connection` backend abstraction. PostgreSQL is planned.
 
 ## How it works
 
@@ -14,12 +15,14 @@ coroutine) variants of every method, plus a connection **pool**.
   `extern "C"` (the rest is full C++: [sol2](https://github.com/ThePhD/sol2) +
   `std::thread` + STL).
 - Queries run on a **pool** of `pool_size` worker threads, each owning its own
-  SQLite connection. Workers **never touch the Lua state**. Results land on a
-  mutex-protected queue; **`Poll`/`PollAll`** (called each tick on the main thread)
-  drains it and fires callbacks / resumes coroutines. → Lua stays single-threaded,
-  DB I/O stays off the game thread.
+  connection (one `Connection` backend per engine). Workers **never touch the Lua
+  state**. Async results land on a queue that **`Poll`/`PollAll`** drains on the main
+  thread; sync calls block on a condition variable. → Lua stays single-threaded, DB
+  I/O stays off the game thread.
 - A job runs entirely on one connection, so a **transaction** is atomic and
-  `insertId` is the real `last_insert_rowid()` of that connection.
+  `insertId` is the real auto-increment id of that connection.
+- Placeholders (`:0/:1` or `?`) are **real bound parameters** — `:N` is rewritten to
+  positional `?` (string literals skipped), injection-safe on every engine.
 
 ## API
 
@@ -29,12 +32,20 @@ placeholders (or `?`), `Execute` → affectedRows, `Insert` → insertId.
 ```lua
 -- `NormDatabase` is a GLOBAL once the module loads as a package dependency
 -- (no `require` needed). Instantiate by calling the class table:
+-- SQLite:
 local db = NormDatabase({
     engine       = NormDatabase.Engine.SQLite,
     connection   = "game.db",
-    pool_size    = 4,        -- worker/connection count (default 1)
-    placeholders = ":",      -- ":" => :0/:1 named binding (default) | "?" => positional binding
+    pool_size    = 10,       -- worker/connection count (default 10)
+    placeholders = ":",      -- ":" => :0/:1 binding (default) | "?" => positional binding
 }, function(ok, err) end)    -- optional on_ready(ok, err)
+
+-- MySQL / MariaDB (nanos-style connection string):
+local db = NormDatabase({
+    engine     = NormDatabase.Engine.MySQL,
+    connection = "host=127.0.0.1 port=3306 user=root password=secret db=mydb",
+    pool_size  = 10,
+})
 
 -- async: callback FIRST, then variadic bind args
 db:SelectAsync(sql, cb, ...)        -- cb(rows, err)
@@ -93,7 +104,9 @@ Type definitions: `norm_database.meta.lua`.
 ## Build
 
 Requires CMake ≥ 3.16, a C++17 compiler, and network access on first configure
-(CMake `FetchContent` pulls sol2 + the SQLite amalgamation).
+(CMake `FetchContent` pulls sol2, the SQLite amalgamation, and MariaDB Connector/C).
+MySQL uses `WITH_SSL=OFF` (fine for MariaDB native_password on localhost); for MySQL 8
+caching_sha2_password flip it to `SCHANNEL` (Windows) / `OPENSSL` in CMakeLists.
 
 ```
 mkdir build
@@ -107,8 +120,12 @@ nanos loads modules; it sets the global `NormDatabase` (no `require` needed).
 
 ## Status / roadmap
 
-- [x] SQLite engine, callback API, poll-drain queue, batch transaction, prepare.
-- [ ] MySQL / PostgreSQL engines (same API, behind libmariadb / libpq).
+- [x] **SQLite** engine (embedded amalgamation).
+- [x] **MySQL / MariaDB** engine (MariaDB Connector/C, prepared statements).
+- [x] Async (callback) + **sync (blocking)** variants of every method.
+- [x] Connection **pool**, atomic transactions, reliable insertId.
+- [x] `:0/:1` & `?` placeholders as **real bound parameters** (injection-safe).
+- [ ] PostgreSQL engine (same API, behind libpq).
 - [ ] Interactive transactions (a pinned connection for logic-between-statements).
 - [ ] A Norm adapter (`Norm.adapters.norm_database`) wiring `supports_transactions`
       / `supports_returning` to `true`.
